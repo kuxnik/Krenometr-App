@@ -1,5 +1,10 @@
 name: Build APK
-on: [push, workflow_dispatch]
+on:
+  push:
+    paths:
+      - 'KrenometrApp.zip'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
 permissions:
   contents: write
 jobs:

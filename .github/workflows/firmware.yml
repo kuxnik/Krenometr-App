@@ -1,0 +1,38 @@
+name: Build firmware
+on:
+  push:
+    paths:
+      - 'firmware/**'
+      - '.github/workflows/firmware.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ESP32_URL: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+      # как в Arduino IDE: ESP32S3 Dev Module, Flash 16MB, OPI PSRAM, 16M Flash (3MB APP/9.9MB FATFS), USB CDC On Boot
+      FQBN: esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Ядро ESP32 3.3.2
+        run: |
+          arduino-cli core update-index --additional-urls "$ESP32_URL"
+          arduino-cli core install esp32:esp32@3.3.2 --additional-urls "$ESP32_URL"
+      - name: Библиотеки
+        run: arduino-cli lib install "GFX Library for Arduino" "Adafruit BNO08x"
+      - name: Сборка
+        run: arduino-cli compile --fqbn "$FQBN" --warnings default --output-dir out firmware/krenometr
+      - name: Версия
+        id: v
+        run: echo "ver=$(grep -oP '#define FW_VERSION\s+"\K[^"]+' firmware/krenometr/krenometr.ino)" >> "$GITHUB_OUTPUT"
+      - run: cp out/krenometr.ino.bin krenometr.ino.bin && ls -la out
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fw-${{ steps.v.outputs.ver }}-${{ github.run_number }}
+          name: Прошивка ${{ steps.v.outputs.ver }} (сборка ${{ github.run_number }})
+          body: Обновление по воздуху — http://192.168.4.1, «Обновление прошивки», файл krenometr.ino.bin.
+          files: krenometr.ino.bin
+          make_latest: false
