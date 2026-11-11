@@ -42,6 +42,10 @@
 
   v3.12 — без BNO085 курс по гироскопу выставляется по направлению движения GPS (5-е поле строки G1 —
      курс GPS, °; −1 — нет): первый раз сразу, дальше плавно и только на прямой (в повороте GPS запаздывает)
+
+  v3.13 — экраны: кренометр, колёса, горизонт, одометр+компас, часы, G-метр (наддув, ОЖ, обороты убраны);
+     общий пробег и моточасы (NVS + карта microSD: /krenometr/counters.txt, log.csv, trips.csv), /odo;
+     ноль гироскопа подстраивается на стоянке (по скорости) и в движении (по повороту GPS) — курс не уплывает
 */
 
 #pragma GCC optimize("O2")
@@ -52,6 +56,8 @@
 #include <WiFiUdp.h>
 #include <WebServer.h>
 #include <Update.h>
+#include <SPI.h>
+#include <SD.h>
 #include "driver/twai.h"
 #include "esp_heap_caps.h"
 #include "driver/spi_master.h"
@@ -118,7 +124,7 @@ struct ClockData;
 #define ELM_HOST       "192.168.0.10"
 #define ELM_PORT       35000
 #define ELM_PROTO      "6"     // ATSP: 6 — CAN 11 бит 500 кбит/с
-#define FW_VERSION     "3.12"
+#define FW_VERSION     "3.13"
 #define APP_UDP_PORT   4210    // поток данных для Android-приложения
 #define APP_PERIOD_MS  40      // 25 пакетов в секунду
 #define APP_TIMEOUT_MS 3000    // приложение молчит дольше — перестаём слать
@@ -200,6 +206,10 @@ volatile bool  g_bnoFound = false;
 volatile float g_posX = 0, g_posY = 0, g_odometer = 0;
 volatile bool  g_tripReset = false;
 volatile uint32_t g_tripId = 0;        // растёт при каждой новой поездке (приложение перечитывает трек)
+// счётчики (v3.13): общий пробег и моточасы — NVS «cnt» и карта microSD
+volatile double   g_totalM = 0;          // общий пробег, м
+volatile double   g_engineS = 0;         // моточасы, с
+volatile int      g_sdState = 0;         // 0 — карты нет / не проверяли, 1 — пишется, 2 — ошибка
 // приложение на магнитоле (v3.10+)
 volatile bool     g_screenOn = true;     // экран кренометра (выключается из приложения)
 volatile bool     g_apAlways = true;     // своя сеть работает постоянно, без отключения через 10 минут
@@ -659,14 +669,27 @@ void sensorTask(void *) {
       // --- курс: гироскоп всегда, магнитный — если есть ---
       float wb[3] = { w[0] - bias[0], w[1] - bias[1], w[2] - bias[2] };
       gyroHdg = wrap360(gyroHdg - dot3(wb, u) * dt / DEG);   // поворот влево — курс уменьшается
-      // курс по GPS: выставить гироскопический курс, пока нет магнитного (v3.12)
-      static float yawF = 0;                         // сглаженная скорость поворота, °/с
-      static uint32_t brgSeen = 0, gpsAlignedAt = 0;
-      static bool gpsAligned = false;
+      // ---- курс без магнитного компаса (v3.13) ----
+      // 1) стоим (по скорости ELM327 или GPS) — подстраиваем ноль гироскопа: машина не поворачивается
+      static float stillFor = 0;
       {
-        float yr = fabsf(dot3(wb, u)) / DEG;
-        float ky = dt / 0.5f; if (ky > 1) ky = 1;
-        yawF += ky * (yr - yawF);
+        bool canStill = comp && vPrev < 0.1f;
+        bool gpsStill = !comp && g_gpsAt != 0 && millis() - g_gpsAt < 2500 && g_gpsSpeed < 0.3f;
+        float an = norm3(a);
+        if ((canStill || gpsStill) && fabsf(an - 1.0f) < 0.15f) stillFor += dt; else stillFor = 0;
+        if (stillFor > 2.0f) {
+          float kb = dt / 4.0f;
+          float d[3] = { w[0] - bias[0], w[1] - bias[1], w[2] - bias[2] };
+          if (norm3(d) < 0.3f)                       // ~17°/с: больше — значит, всё-таки едем
+            for (int i = 0; i < 3; i++) bias[i] += kb * d[i];
+        }
+      }
+      // 2) едем — по GPS: курс выставляем, а по разнице поворотов GPS и гироскопа правим ноль гироскопа
+      static uint32_t brgSeen = 0, gpsAlignedAt = 0, lastBrgAt = 0;
+      static bool gpsAligned = false;
+      static float lastBrg = -1, gyroTurn = 0;
+      gyroTurn += -dot3(wb, u) * dt / DEG;           // поворот по гироскопу с прошлого курса GPS, °
+      {
         bool magOk = false;
 #if USE_BNO085
         magOk = g_bnoFound && millis() - bnoAt < 500 && bnoFrameOk;
@@ -675,14 +698,31 @@ void sensorTask(void *) {
         if (bs != brgSeen) {
           brgSeen = bs;
           float brg = g_gpsBrg;
-          if (!magOk && brg >= 0 && yawF < 4.0f) {      // на прямой: в повороте курс GPS запаздывает
+          uint32_t nowMs = millis();
+          bool straight = false;
+          if (!magOk && brg >= 0) {
+            if (lastBrg >= 0 && nowMs - lastBrgAt > 100 && nowMs - lastBrgAt < 2500) {
+              float T = (nowMs - lastBrgAt) / 1000.0f;
+              float gt = brg - lastBrg;
+              while (gt > 180) gt -= 360;
+              while (gt < -180) gt += 360;
+              straight = fabsf(gt / T) < 3.0f;          // по GPS едем прямо
+              float e = (gyroTurn - gt) / T;             // лишнее вращение гироскопа, °/с
+              if (straight && fabsf(e) < 20.0f) {
+                float db = -e * DEG * 0.3f;
+                for (int i = 0; i < 3; i++) bias[i] += db * u[i];
+              }
+            }
             float err = brg - gyroHdg;
             while (err > 180) err -= 360;
             while (err < -180) err += 360;
-            gyroHdg = wrap360(gyroHdg + (gpsAligned ? 0.15f : 1.0f) * err);
+            float k = !gpsAligned ? 1.0f : straight ? 0.3f : 0.1f;
+            gyroHdg = wrap360(gyroHdg + k * err);
             gpsAligned = true;
-            gpsAlignedAt = millis();
-          }
+            gpsAlignedAt = nowMs;
+            lastBrg = brg; lastBrgAt = nowMs;
+          } else lastBrg = -1;
+          gyroTurn = 0;
         }
       }
       float hdg = gyroHdg;
@@ -716,8 +756,10 @@ void sensorTask(void *) {
       // скорость: с ELM327, а если её нет — с GPS магнитолы
       bool gpsV = !comp && g_gpsAt != 0 && millis() - g_gpsAt < 2500 && g_gpsAcc > 0 && g_gpsAcc < 30;
       float vPath = comp ? vF : (gpsV ? (float)g_gpsSpeed : 0.0f);
+      static double pendDist = 0;              // пройдено с прошлой публикации — в общий пробег
       if (vPath > 0.3f) {
         float ds = vPath * dt;
+        pendDist += ds;
         posX += ds * sinf(hdg * DEG);
         posY += ds * cosf(hdg * DEG);
         odo += ds;
@@ -733,6 +775,7 @@ void sensorTask(void *) {
       g_gLon = gLon; g_gLat = gLat;
       g_heading = hdg; g_headingSrc = src;
       g_posX = posX; g_posY = posY; g_odometer = odo;
+      g_totalM = g_totalM + pendDist; pendDist = 0;
       portEXIT_CRITICAL(&mux);
     }
 
@@ -1117,7 +1160,8 @@ void elmTask(void *) {
       elmWheels();                               // экран колёс: колёса и скорость по очереди
     } else {
       static uint8_t wcnt = 0;
-      pid = g_wantWheels ? (++wcnt % 10 == 0 ? PID_COOLANT : PID_SPEED) : seq[idx];
+      ++wcnt;
+      pid = g_wantWheels ? (wcnt % 10 == 0 ? PID_COOLANT : wcnt % 10 == 5 ? PID_RPM : PID_SPEED) : seq[idx];
       if (!g_wantWheels) idx = (idx + 1) % 8;
       if (pid) ok = elmPid(pid);
       else {
@@ -1504,6 +1548,7 @@ int textWidth(const AAFont &f, const char *s) {
 enum { AL_LEFT, AL_CENTER, AL_RIGHT };
 
 // y — базовая линия
+int g_clipY0 = -100000, g_clipY1 = 100000;      // окно по строкам (физ. пиксели) — для барабанов одометра
 void text(float fx, float y, const char *s, const AAFont &f, uint16_t c, int align = AL_CENTER, uint8_t alpha = 255) {
   int x = (int)lroundf(fx * SC);
   y *= SC;
@@ -1517,6 +1562,7 @@ void text(float fx, float y, const char *s, const AAFont &f, uint16_t c, int ali
     int stride = (g->w + 1) / 2;
     int gy = by + g->yo;
     int rA = std::max(0, bandY0 - gy), rB = std::min((int)g->h, bandY1 - gy);   // только строки текущей полосы
+    rA = std::max(rA, g_clipY0 - gy); rB = std::min(rB, g_clipY1 - gy);
     for (int r = rA; r < rB; r++)
       for (int col = 0; col < g->w; col++) {
         uint8_t b = p[r * stride + col / 2];
@@ -2266,6 +2312,86 @@ void pagePath(float hdg, int src, float posX, float posY, float odo) {
   }
 }
 
+// ---- Одометр + компас (v3.13): барабаны как на классической приборке, вокруг — картушка компаса ----
+// Ряд барабанов: n ячеек, последние dec — доли (красные). Младший барабан крутится плавно,
+// старшие — только когда все младшие стоят на 9 (как в механическом счётчике).
+void drumRow(float cx, float cy, int n, int dec, double value, float cw, float ch, const AAFont &f, float capH) {
+  const float gap = 2;
+  double scale = 1; for (int i = 0; i < dec; i++) scale *= 10;
+  double u = value * scale;
+  if (u < 0) u = 0;
+  double lim = 1; for (int i = 0; i < n; i++) lim *= 10;
+  u = fmod(u, lim);
+  uint64_t iu = (uint64_t)u;
+  float fr = (float)(u - (double)iu);
+  float w = n * cw + (n - 1) * gap;
+  rrectAA(cx, cy, w / 2 + 3, ch / 2 + 3, 4, 0, rgb(70, 70, 74));     // рамка
+  rrectAA(cx, cy, w / 2 + 1.8f, ch / 2 + 1.8f, 3, 0, rgb(8, 8, 9));
+  uint64_t p = 1;
+  for (int k = 0; k < n; k++) {
+    float x = cx + w / 2 - cw / 2 - k * (cw + gap);
+    int digit = (int)((iu / p) % 10);
+    float roll = k == 0 ? fr : ((iu % p) == p - 1 ? fr : 0.0f);
+    bool frac = k < dec;
+    uint16_t bg = frac ? rgb(150, 28, 24) : rgb(30, 30, 33);
+    uint16_t fg = frac ? rgb(255, 236, 230) : rgb(236, 236, 236);
+    rrectAA(x, cy, cw / 2, ch / 2, 1.5f, 0, bg);
+    g_clipY0 = (int)lroundf((cy - ch / 2) * SC);
+    g_clipY1 = (int)lroundf((cy + ch / 2) * SC);
+    char d[2] = {(char)('0' + digit), 0};
+    float base = cy + capH / 2 - roll * ch;
+    text(x, base, d, f, fg);
+    if (roll > 0.001f) { d[0] = (char)('0' + (digit + 1) % 10); text(x, base + ch, d, f, fg); }
+    g_clipY0 = -100000; g_clipY1 = 100000;
+    // «цилиндр»: тень сверху и снизу ячейки
+    rrectAA(x, cy - ch / 2 + ch * 0.12f, cw / 2, ch * 0.12f, 0, 0, IOS_BG, 110);
+    rrectAA(x, cy + ch / 2 - ch * 0.12f, cw / 2, ch * 0.12f, 0, 0, IOS_BG, 110);
+    p *= 10;
+  }
+}
+
+void pageNav(float hdg, int src, int acc, float odo) {
+  // картушка: поворачивается, сверху — направление движения
+  for (int b = 0; b < 360; b += 5) {
+    float a = (b - hdg - 90) * DEG, cs = cosf(a), sn = sinf(a);
+    bool major = b % 30 == 0;
+    float r1 = major ? 104 : 108, r2 = 115;
+    lineAA(120 + r1 * cs, 120 + r1 * sn, 120 + r2 * cs, 120 + r2 * sn, major ? 2.0f : 1.0f, major ? IOS_WHITE : IOS_GRAY2);
+  }
+  {
+    float a = (-hdg - 90) * DEG, cs = cosf(a), sn = sinf(a);
+    float px[3] = {120 + 119 * cs, 120 + 112 * cs - 4.5f * sn, 120 + 112 * cs + 4.5f * sn};
+    float py[3] = {120 + 119 * sn, 120 + 112 * sn + 4.5f * cs, 120 + 112 * sn - 4.5f * cs};
+    polyAA(px, py, 3, IOS_RED);
+  }
+  static const char *card[4] = {"С", "В", "Ю", "З"};
+  for (int b = 0; b < 360; b += 90) {
+    float a = (b - hdg - 90) * DEG;
+    text(120 + 93 * cosf(a), 120 + 93 * sinf(a) + 5.5f, card[b / 90], F_SMALL, b == 0 ? IOS_RED : IOS_WHITE);
+  }
+  { float px[3] = {120, 115, 125}, py[3] = {16, 6, 6}; polyAA(px, py, 3, IOS_WHITE); }   // неподвижная метка
+
+  char b[40];
+  snprintf(b, sizeof(b), "%d° %s", (int)lroundf(wrap360(hdg)) % 360, dirName(hdg));
+  text(120, 60, b, F_MED, IOS_WHITE);
+
+  double tot, eng;
+  portENTER_CRITICAL(&mux); tot = g_totalM; eng = g_engineS; portEXIT_CRITICAL(&mux);
+  text(120, 83, "пробег, км", F_TINY, IOS_GRAY);
+  drumRow(120, 102, 7, 1, tot / 1000.0, 17, 25, F_MED, 15.5f);
+  text(120, 134, "поездка, км", F_TINY, IOS_GRAY);
+  drumRow(120, 150, 5, 1, odo / 1000.0, 14, 20, F_SMALL, 11);
+  char e[24]; fmtNum(e, sizeof(e), (float)(eng / 3600.0), 1);
+  snprintf(b, sizeof(b), "моточасы %s", e);
+  text(120, 182, b, F_SMALL, rgb(200, 200, 204));
+
+  bool spd = (USE_CAN && g_canOk) || (g_gpsAt && millis() - g_gpsAt < 2500);
+  const char *st = !spd ? "нет скорости: ELM327 или GPS"
+                 : src == 2 ? (acc >= 2 ? "компас магнитный" : "компас: калибровка")
+                 : src == 3 ? "курс по GPS" : "курс по гироскопу";
+  text(120, 200, st, F_TINY, !spd ? IOS_ORANGE : IOS_GRAY2);
+}
+
 // ---- Дополнительные приборы ----
 struct Gauge {
   const char *title, *unit;
@@ -2591,9 +2717,11 @@ uint32_t appSeq = 0;
 int appPacket(char *pkt, size_t sz) {
   float roll, pitch, lon, lat, hdg, px, py, odo;
   int hs;
+  double totKm, engH;
   portENTER_CRITICAL(&mux);
   roll = g_roll; pitch = g_pitch; lon = g_gLon; lat = g_gLat; hdg = g_heading; hs = g_headingSrc;
   px = g_posX; py = g_posY; odo = g_odometer;
+  totKm = g_totalM / 1000.0; engH = g_engineS / 3600.0;
   portEXIT_CRITICAL(&mux);
   uint32_t now = millis();
   auto fr = [now](uint32_t at, uint32_t ms) { return at != 0 && now - at < ms; };
@@ -2609,7 +2737,8 @@ int appPacket(char *pkt, size_t sz) {
     "\"e\":%d,\"c\":%d,\"sp\":%d,\"rpm\":%d,\"bo\":%.2f,\"bok\":%d,"
     "\"cl\":%d,\"ia\":%d,\"u\":%.1f,\"f\":%d,"
     "\"w\":[%d,%d,%d,%d],\"wa\":%ld,"
-    "\"scr\":%d,\"ap\":%d,\"zd\":%lu,\"tm\":%d,\"ga\":%.0f}",
+    "\"scr\":%d,\"ap\":%d,\"zd\":%lu,\"tm\":%d,\"ga\":%.0f,"
+    "\"tot\":%.2f,\"mh\":%.3f,\"sd\":%d}",
     (unsigned long)appSeq++, g_calibrating ? 1 : 0, g_imuOk ? 1 : 0,
     roll, pitch, lon, lat,
     hdg, hs, (int)g_magAccuracy, !USE_BNO085 ? -1 : !g_bnoFound ? 0 : hs == 2 ? 2 : 1, (int)g_tiltSrc,
@@ -2625,7 +2754,8 @@ int appPacket(char *pkt, size_t sz) {
     (int)g_wheel[0], (int)g_wheel[1], (int)g_wheel[2], (int)g_wheel[3], wAge,
     g_screenOn ? 1 : 0, g_apAlways ? 1 : 0, (unsigned long)g_zeroDoneAt,
     (elmTermLastAt && now - elmTermLastAt < 60000) ? 1 : 0,
-    fr(g_gpsAt, 3000) ? (float)g_gpsAcc : -1.0f);
+    fr(g_gpsAt, 3000) ? (float)g_gpsAcc : -1.0f,
+    totKm, engH, (int)g_sdState);
 }
 
 void appHello(const char *in) {
@@ -2675,6 +2805,9 @@ static void usbEsc(const char *s, int n, void *) {
   if (k) Serial.write((const uint8_t *)o, k);
 }
 
+void odoSet(const char *km, const char *mh);
+void odoText(char *b, size_t n);
+
 void usbRequest(const char *line) {
   char *sp = nullptr;
   long id = strtol(line + 1, &sp, 10);
@@ -2699,6 +2832,12 @@ void usbRequest(const char *line) {
   }
   else if (pathIs(path, "/info")) appInfoJson(body, sizeof(body));
   else if (pathIs(path, "/trk")) track = true;
+  else if (pathIs(path, "/odo")) {
+    char m[32];
+    bool hk = qArg(path, "km", a, sizeof(a)), hm = qArg(path, "mh", m, sizeof(m));
+    if (hk || hm) odoSet(hk ? a : nullptr, hm ? m : nullptr);
+    odoText(body, sizeof(body));
+  }
 #if CAR_LINK == 1
   else if (pathIs(path, "/cmd")) {
     if (elmTermPending) strcpy(body, "busy");
@@ -2784,6 +2923,158 @@ void appUdpTask(void *) {
       appUdp.endPacket();
     }
   }
+}
+
+// ===================== Счётчики: пробег и моточасы (v3.13) =====================
+// Пробег — по той же скорости, что и путь (ELM327, без неё — GPS). Моточасы — пока ЭБУ отдаёт обороты > 300.
+// Хранятся в NVS (раз в минуту) и на карте microSD: /krenometr/counters.txt (текущие значения),
+// /krenometr/log.csv (строка в минуту, пока едем или работает мотор), /krenometr/trips.csv (поездки).
+#define PIN_SD_CS   38
+#define PIN_SD_MOSI 39
+#define PIN_SD_MISO 40
+#define PIN_SD_SCK  41
+SPIClass sdSpi(HSPI);                    // SPI2 занят экраном
+Preferences prefsCnt;
+volatile bool g_cntSaveReq = false;      // сохранить сразу (после /odo)
+
+static void nowStr(char *b, size_t n) {
+  ClockData c;
+  portENTER_CRITICAL(&mux); c = g_clock; portEXIT_CRITICAL(&mux);
+  if (c.ok && c.valid) snprintf(b, n, "%04d-%02d-%02d %02d:%02d:%02d", c.year, c.mon, c.day, c.hh, c.mm, c.ss);
+  else snprintf(b, n, "без времени +%lus", (unsigned long)(millis() / 1000));
+}
+
+static bool sdMount() {
+  sdSpi.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
+  if (!SD.begin(PIN_SD_CS, sdSpi, 10000000, "/sd", 4)) { SD.end(); return false; }
+  if (SD.cardType() == CARD_NONE) { SD.end(); return false; }
+  if (!SD.exists("/krenometr")) SD.mkdir("/krenometr");
+  return true;
+}
+
+// counters.txt: «пробег_км=12345.67» и «моточасы=1234.56»
+static void sdReadCounters(double &km, double &h) {
+  km = h = -1;
+  File f = SD.open("/krenometr/counters.txt", FILE_READ);
+  if (!f) return;
+  while (f.available()) {
+    String l = f.readStringUntil('\n');
+    int e = l.indexOf('=');
+    if (e < 0) continue;
+    String k = l.substring(0, e); k.trim();
+    double v = l.substring(e + 1).toDouble();
+    if (k == "probeg_km") km = v;
+    else if (k == "motochasy") h = v;
+  }
+  f.close();
+}
+
+static bool sdWriteCounters(double km, double h) {
+  File f = SD.open("/krenometr/counters.txt", FILE_WRITE);
+  if (!f) return false;
+  char t[32]; nowStr(t, sizeof(t));
+  f.printf("# Кренометр %s, обновлено %s\nprobeg_km=%.2f\nmotochasy=%.3f\n", FW_VERSION, t, km, h);
+  f.close();
+  return true;
+}
+
+static bool sdAppend(const char *path, const char *header, const char *line) {
+  bool isNew = !SD.exists(path);
+  File f = SD.open(path, FILE_APPEND);
+  if (!f) return false;
+  if (isNew) f.print(header);
+  f.print(line);
+  f.close();
+  return true;
+}
+
+void counterTask(void *) {
+  prefsCnt.begin("cnt", false);
+  double km = prefsCnt.getDouble("km", 0), eh = prefsCnt.getDouble("eh", 0);
+  bool sdOk = sdMount();
+  if (sdOk) {                                    // карта могла пережить замену платы — берём большее
+    double skm, sh; sdReadCounters(skm, sh);
+    if (skm > km) km = skm;
+    if (sh > eh) eh = sh;
+  }
+  g_sdState = sdOk ? 1 : 0;
+  portENTER_CRITICAL(&mux);
+  g_totalM = g_totalM + km * 1000.0;             // + то, что уже успели проехать после включения
+  g_engineS = g_engineS + eh * 3600.0;
+  portEXIT_CRITICAL(&mux);
+  Serial.printf("Счётчики: %.1f км, %.2f моточаса, SD %s\n", km, eh, sdOk ? "есть" : "нет");
+
+  uint32_t lastTick = millis(), lastSave = millis(), lastSdTry = millis();
+  double savedKm = km, savedEh = eh;
+  uint32_t lastTrip = g_tripId;
+  float lastOdo = 0;
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    uint32_t now = millis();
+    float dts = (now - lastTick) / 1000.0f; lastTick = now;
+    bool engine = USE_CAN && g_rpmAt && now - g_rpmAt < 10000 && g_rpm > 300;
+    double totM, engS; float odo;
+    portENTER_CRITICAL(&mux);
+    if (engine) g_engineS = g_engineS + dts;
+    totM = g_totalM; engS = g_engineS; odo = g_odometer;
+    portEXIT_CRITICAL(&mux);
+    double curKm = totM / 1000.0, curEh = engS / 3600.0;
+
+    // поездка закончилась (новая поездка) — строка в trips.csv
+    uint32_t tid = g_tripId;
+    if (tid != lastTrip) {
+      if (g_sdState == 1 && lastOdo > 50) {
+        char t[32], l[120]; nowStr(t, sizeof(t));
+        snprintf(l, sizeof(l), "%s;%.2f;%.1f;%.2f\n", t, lastOdo / 1000.0f, curKm, curEh);
+        if (!sdAppend("/krenometr/trips.csv", "время;поездка_км;пробег_км;моточасы\n", l)) g_sdState = 2;
+      }
+      lastTrip = tid;
+    }
+    lastOdo = odo;
+
+    // карту вставили позже или она отвалилась — пробуем раз в 30 с
+    if (g_sdState != 1 && now - lastSdTry > 30000) {
+      lastSdTry = now;
+      SD.end();
+      if (sdMount()) g_sdState = 1;
+    }
+
+    bool changed = fabs(curKm - savedKm) > 0.0005 || fabs(curEh - savedEh) > 0.00001;
+    if ((changed && now - lastSave > 60000) || g_cntSaveReq) {
+      g_cntSaveReq = false;
+      lastSave = now;
+      prefsCnt.putDouble("km", curKm);
+      prefsCnt.putDouble("eh", curEh);
+      if (g_sdState == 1) {
+        char t[32], l[140]; nowStr(t, sizeof(t));
+        float spd = g_canOk ? (float)g_speedKmh : (g_gpsAt && now - g_gpsAt < 3000 ? g_gpsSpeed * 3.6f : -1);
+        snprintf(l, sizeof(l), "%s;%.2f;%.3f;%.2f;%.0f;%d\n", t, curKm, curEh, odo / 1000.0f, spd, engine ? (int)g_rpm : 0);
+        bool ok = sdWriteCounters(curKm, curEh) &&
+                  sdAppend("/krenometr/log.csv", "время;пробег_км;моточасы;поездка_км;скорость;обороты\n", l);
+        if (!ok) g_sdState = 2;
+      }
+      savedKm = curKm; savedEh = curEh;
+    }
+  }
+}
+
+// /odo — текущие счётчики «км часы»; /odo?km=123456.7&mh=1234.5 — установить (как на приборке)
+void odoSet(const char *km, const char *mh) {
+  if (km && *km) { double v = atof(km); if (v >= 0) { portENTER_CRITICAL(&mux); g_totalM = v * 1000.0; portEXIT_CRITICAL(&mux); } }
+  if (mh && *mh) { double v = atof(mh); if (v >= 0) { portENTER_CRITICAL(&mux); g_engineS = v * 3600.0; portEXIT_CRITICAL(&mux); } }
+  g_cntSaveReq = true;
+}
+void odoText(char *b, size_t n) {
+  double t, e;
+  portENTER_CRITICAL(&mux); t = g_totalM; e = g_engineS; portEXIT_CRITICAL(&mux);
+  snprintf(b, n, "%.2f %.3f %d", t / 1000.0, e / 3600.0, g_sdState);
+}
+void handleOdo() {
+  wifiLastActivity = millis();
+  if (server.hasArg("km") || server.hasArg("mh"))
+    odoSet(server.hasArg("km") ? server.arg("km").c_str() : nullptr, server.hasArg("mh") ? server.arg("mh").c_str() : nullptr);
+  char b[64]; odoText(b, sizeof(b));
+  server.send(200, "text/plain", b);
 }
 
 void handleRotate() {
@@ -2892,6 +3183,7 @@ void wifiStart() {
     server.on("/trip", HTTP_GET, handleTrip);
     server.on("/trk", HTTP_GET, handleTrack);
     server.on("/info", HTTP_GET, handleInfo);
+    server.on("/odo", HTTP_GET, handleOdo);
     server.on("/update", HTTP_POST, handleUploadDone, handleUploadChunk);
     server.onNotFound(sendIndex);
     serverStarted = true;
@@ -2919,9 +3211,10 @@ void wifiService() {
 }
 
 // ===================== Основная программа (ядро 1) =====================
-enum { PAGE_TILT = 0, PAGE_WHEELS, PAGE_HORIZON, PAGE_COMPASS, PAGE_PATH, PAGE_CLOCK,
+// v3.13: путь и компас — один экран «одометр»; наддув, ОЖ и обороты убраны (они есть в приложении)
+enum { PAGE_TILT = 0, PAGE_WHEELS, PAGE_HORIZON, PAGE_NAV, PAGE_CLOCK,
 #if EXTRA_PAGES
-       PAGE_BOOST, PAGE_COOLANT, PAGE_RPM, PAGE_GMETER,
+       PAGE_GMETER,
 #endif
        NUM_PAGES };
 
@@ -2942,9 +3235,6 @@ void resetPagePeaks() {
   switch (page) {
     case PAGE_TILT: case PAGE_HORIZON: maxRoll = maxPitch = 0; break;
 #if EXTRA_PAGES
-    case PAGE_BOOST:   peakBoost = 0; break;
-    case PAGE_COOLANT: peakCool = NAN; break;
-    case PAGE_RPM:     peakRpm = 0; break;
     case PAGE_GMETER:  gmAcc = gmBrake = gmLeft = gmRight = 0; break;
 #endif
     default: return;
@@ -2952,7 +3242,7 @@ void resetPagePeaks() {
   toast("Максимумы сброшены");
 }
 
-bool longPressPage() { return page == PAGE_TILT || page == PAGE_HORIZON || page == PAGE_WHEELS || page == PAGE_PATH; }
+bool longPressPage() { return page == PAGE_TILT || page == PAGE_HORIZON || page == PAGE_WHEELS || page == PAGE_NAV; }
 
 void handleTouch() {
   bool pressed = g_touch;
@@ -3060,6 +3350,7 @@ void setup() {
   if (g_apAlways) wifiStart();
 #endif
   xTaskCreatePinnedToCore(appUdpTask, "app", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(counterTask, "cnt", 6144, NULL, 1, NULL, 0);
 }
 
 // Состояние кадра: считается один раз, а рисуется по полосам
@@ -3100,8 +3391,7 @@ void updateFrame() {
 
   frm.sub[0] = 0;
 #if EXTRA_PAGES
-  if (page == PAGE_BOOST && fresh(g_iatAt, 5000)) snprintf(frm.sub, sizeof(frm.sub), "впуск %d°C", (int)g_iat);
-  if (page == PAGE_RPM && g_volt > 0) {
+  if (false && g_volt > 0) {
     char v[24]; fmtNum(v, sizeof(v), g_volt, 1, " В");
     snprintf(frm.sub, sizeof(frm.sub), "бортсеть %s", v);
   }
@@ -3127,13 +3417,9 @@ void renderScene() {
     case PAGE_TILT:    pageTilt(frm.roll, frm.pitch); break;
     case PAGE_HORIZON: pageHorizon(frm.roll, frm.pitch, frm.lat); break;
     case PAGE_WHEELS:  pageWheels(frm.roll, frm.pitch); break;
-    case PAGE_COMPASS: pageCompass(frm.hdg, frm.src, g_magAccuracy); break;
+    case PAGE_NAV:     pageNav(frm.hdg, frm.src, g_magAccuracy, frm.odo); break;
     case PAGE_CLOCK:   pageClock(); break;
-    case PAGE_PATH:    pagePath(frm.hdg, frm.src, frm.px, frm.py, frm.odo); break;
 #if EXTRA_PAGES
-    case PAGE_BOOST:   pageGauge(G_BOOST, frm.boost, frm.mapOk, peakBoost, frm.sub); break;
-    case PAGE_COOLANT: pageGauge(G_COOLANT, g_coolant, frm.coolOk, peakCool, ""); break;
-    case PAGE_RPM:     pageGauge(G_RPM, g_rpm, frm.rpmOk, peakRpm, frm.sub); break;
     case PAGE_GMETER:  pageGMeter(frm.lon, frm.lat); break;
 #endif
   }
