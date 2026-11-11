@@ -39,6 +39,9 @@
      строками JSON 25 раз/с; запросы «Q<номер> /адрес?…» → ответ «R<номер> текст» (\n внутри текста — перевод строки)
    - строки «G1 широта долгота точность_м скорость_м/с» (по UDP или USB): путь подтягивается к GPS,
      а без скорости с ELM327 путь считается по скорости GPS
+
+  v3.12 — без BNO085 курс по гироскопу выставляется по направлению движения GPS (5-е поле строки G1 —
+     курс GPS, °; −1 — нет): первый раз сразу, дальше плавно и только на прямой (в повороте GPS запаздывает)
 */
 
 #pragma GCC optimize("O2")
@@ -115,7 +118,7 @@ struct ClockData;
 #define ELM_HOST       "192.168.0.10"
 #define ELM_PORT       35000
 #define ELM_PROTO      "6"     // ATSP: 6 — CAN 11 бит 500 кбит/с
-#define FW_VERSION     "3.11"
+#define FW_VERSION     "3.12"
 #define APP_UDP_PORT   4210    // поток данных для Android-приложения
 #define APP_PERIOD_MS  40      // 25 пакетов в секунду
 #define APP_TIMEOUT_MS 3000    // приложение молчит дольше — перестаём слать
@@ -205,6 +208,8 @@ volatile uint32_t g_appSeenAt = 0;       // когда приложение по
 // GPS магнитолы (v3.11): скорость — запасная для счисления, координаты — мягкая поправка пути
 volatile float    g_gpsAcc = -1, g_gpsSpeed = 0;   // точность, м; скорость, м/с
 volatile uint32_t g_gpsAt = 0;
+volatile float    g_gpsBrg = -1;                    // курс по GPS, ° (v3.12)
+volatile uint32_t g_gpsBrgSeq = 0;                  // растёт с каждым годным курсом GPS
 volatile float    g_gpsCorrX = 0, g_gpsCorrY = 0;  // накопленная поправка, м (забирает задача датчиков)
 float trackX[TRACK_MAX], trackY[TRACK_MAX];
 volatile int trackN = 0;
@@ -654,8 +659,34 @@ void sensorTask(void *) {
       // --- курс: гироскоп всегда, магнитный — если есть ---
       float wb[3] = { w[0] - bias[0], w[1] - bias[1], w[2] - bias[2] };
       gyroHdg = wrap360(gyroHdg - dot3(wb, u) * dt / DEG);   // поворот влево — курс уменьшается
+      // курс по GPS: выставить гироскопический курс, пока нет магнитного (v3.12)
+      static float yawF = 0;                         // сглаженная скорость поворота, °/с
+      static uint32_t brgSeen = 0, gpsAlignedAt = 0;
+      static bool gpsAligned = false;
+      {
+        float yr = fabsf(dot3(wb, u)) / DEG;
+        float ky = dt / 0.5f; if (ky > 1) ky = 1;
+        yawF += ky * (yr - yawF);
+        bool magOk = false;
+#if USE_BNO085
+        magOk = g_bnoFound && millis() - bnoAt < 500 && bnoFrameOk;
+#endif
+        uint32_t bs = g_gpsBrgSeq;
+        if (bs != brgSeen) {
+          brgSeen = bs;
+          float brg = g_gpsBrg;
+          if (!magOk && brg >= 0 && yawF < 4.0f) {      // на прямой: в повороте курс GPS запаздывает
+            float err = brg - gyroHdg;
+            while (err > 180) err -= 360;
+            while (err < -180) err += 360;
+            gyroHdg = wrap360(gyroHdg + (gpsAligned ? 0.15f : 1.0f) * err);
+            gpsAligned = true;
+            gpsAlignedAt = millis();
+          }
+        }
+      }
       float hdg = gyroHdg;
-      int src = 1;
+      int src = gpsAligned && millis() - gpsAlignedAt < 120000 ? 3 : 1;   // 3 — гироскоп, выставлен по GPS
 #if USE_BNO085
       float mh;
       static uint32_t bnoRetryAt = 0;
@@ -1789,6 +1820,7 @@ void pageCompass(float hdg, int src, int acc) {
   text(124, 132, b, F_BIG, IOS_WHITE);
   text(120, 156, dirName(hdg), F_SMALL, IOS_GRAY);
   const char *s = src == 2 ? (acc >= 2 ? "магнитный" : "калибровка")
+                 : src == 3 ? "гироскоп · выставлен по GPS"
                  : (USE_BNO085 && !g_bnoFound) ? "по гироскопу · BNO085 не найден"
                  : USE_BNO085 ? "по гироскопу · BNO085 молчит" : "по гироскопу";
   text(120, 174, s, F_TINY, src == 2 && acc < 2 ? IOS_ORANGE : IOS_GRAY2);
@@ -2226,11 +2258,11 @@ void pagePath(float hdg, int src, float posX, float posY, float odo) {
   lineAA(120 - VIEW_R / 4, 196, 120 + VIEW_R / 4, 196, 2, IOS_GRAY2);
   text(120, 192, sc, F_TINY, IOS_GRAY2);
 
-  if (!(USE_CAN && g_canOk)) {
+  if (!(USE_CAN && g_canOk) && !(g_gpsAt && millis() - g_gpsAt < 2500)) {
     rrectAA(120, 160, 74, 13, 13, 0, IOS_BG, 200);
     text(120, 164, "нет скорости с CAN", F_TINY, IOS_ORANGE);
   } else if (src != 2) {
-    text(120, 52, "курс по гироскопу", F_TINY, IOS_GRAY2);
+    text(120, 52, src == 3 ? "курс по GPS" : "курс по гироскопу", F_TINY, IOS_GRAY2);
   }
 }
 
@@ -2390,7 +2422,7 @@ $('r').textContent=c(d.r,1)+'°';$('p').textContent=c(d.p,1)+'°';
 $('h').textContent=Math.round(d.h)%360+'°';$('o').textContent=d.o<1000?Math.round(d.o)+' м':c(d.o/1000,1)+' км';
 $('s').textContent=d.c?d.s+' км/ч':'—';$('b').textContent=d.c&&d.m>0?c(d.b,2)+' бар':'—';
 $('t').textContent=d.c&&d.t>-100?d.t+'°C':'—';$('u').textContent=d.c&&d.u>0?c(d.u,1)+' В':'—';
-$('cs').textContent=(d.c?'Машина: данные идут':'Машина: нет данных')+(d.f>-100?' · ATF '+d.f+'°C':'')+' · компас: '+(d.hs==2?'магнитный':'гироскоп')+(d.bn==0?' (BNO085 не найден)':d.bn==1?' (BNO085 найден, данных нет)':'')+' · крен: '+(d.ts==2?'BNO085':'датчик платы');
+$('cs').textContent=(d.c?'Машина: данные идут':'Машина: нет данных')+(d.f>-100?' · ATF '+d.f+'°C':'')+' · компас: '+(d.hs==2?'магнитный':d.hs==3?'гироскоп, выставлен по GPS':'гироскоп')+(d.bn==0?' (BNO085 не найден)':d.bn==1?' (BNO085 найден, данных нет)':'')+' · крен: '+(d.ts==2?'BNO085':'датчик платы');
 if($('es'))$('es').textContent=['Ищу Wi-Fi сеть адаптера…','Сеть есть, адаптер не отвечает (занят магнитолой?)','Адаптер подключён, ЭБУ молчит (зажигание?)','Подключено, данные идут'][d.e]||'—';
 }).catch(()=>{}),500);
 function sv(){const q=i=>encodeURIComponent($(i).value);fetch('/elmcfg?s='+q('es1')+'&p='+q('es2')+'&h='+q('es3')+'&o='+q('es4')+'&r='+q('es5')).then(()=>{$('es').textContent='Сохранено, переподключаюсь…'})}
@@ -2527,10 +2559,13 @@ void handleInfo() {
 // GPS магнитолы: «G1 широта долгота точность скорость». Начало координат — первый фикс поездки,
 // привязанный к текущей точке счисления; дальше путь мягко подтягивается к GPS.
 void appGps(const char *line) {
-  double lat, lon; float acc, spd;
-  if (sscanf(line + 2, "%lf %lf %f %f", &lat, &lon, &acc, &spd) != 4) return;
+  double lat, lon; float acc, spd, brg = -1;
+  int nf = sscanf(line + 2, "%lf %lf %f %f %f", &lat, &lon, &acc, &spd, &brg);
+  if (nf < 4) return;
   if (acc <= 0 || lat < -90 || lat > 90 || lon < -180 || lon > 180) return;
   g_gpsAcc = acc; g_gpsSpeed = spd < 0 ? 0 : spd; g_gpsAt = millis();
+  // курс годится, только когда едем (от ~11 км/ч) и фикс точный
+  if (nf == 5 && brg >= 0 && brg < 360 && spd >= 3.0f && acc <= 25) { g_gpsBrg = brg; g_gpsBrgSeq = g_gpsBrgSeq + 1; }
   static bool have = false;
   static uint32_t trip = 0;
   static double lat0 = 0, lon0 = 0;
