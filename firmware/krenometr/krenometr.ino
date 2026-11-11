@@ -197,6 +197,11 @@ volatile bool  g_bnoFound = false;
 volatile float g_posX = 0, g_posY = 0, g_odometer = 0;
 volatile bool  g_tripReset = false;
 volatile uint32_t g_tripId = 0;        // растёт при каждой новой поездке (приложение перечитывает трек)
+// приложение на магнитоле (v3.10+)
+volatile bool     g_screenOn = true;     // экран кренометра (выключается из приложения)
+volatile bool     g_apAlways = true;     // своя сеть работает постоянно, без отключения через 10 минут
+volatile bool     g_appWheels = false;   // в приложении открыт экран колёс — опрашивать ABS
+volatile uint32_t g_appSeenAt = 0;       // когда приложение последний раз отзывалось
 // GPS магнитолы (v3.11): скорость — запасная для счисления, координаты — мягкая поправка пути
 volatile float    g_gpsAcc = -1, g_gpsSpeed = 0;   // точность, м; скорость, м/с
 volatile uint32_t g_gpsAt = 0;
@@ -2431,10 +2436,6 @@ void handleTermResult() {
 #endif
 
 // ===================== v3.10: Android-приложение =====================
-volatile bool     g_screenOn = true;     // экран кренометра (выключается из приложения)
-volatile bool     g_apAlways = true;     // своя сеть работает постоянно, без отключения через 10 минут
-volatile bool     g_appWheels = false;   // в приложении открыт экран колёс — опрашивать ABS
-volatile uint32_t g_appSeenAt = 0;       // когда приложение последний раз отзывалось
 extern Preferences prefsUi;
 
 bool appActive() { return g_appSeenAt != 0 && millis() - g_appSeenAt < APP_TIMEOUT_MS; }
