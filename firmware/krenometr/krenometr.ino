@@ -46,6 +46,8 @@
   v3.13 — экраны: кренометр, колёса, горизонт, одометр+компас, часы, G-метр (наддув, ОЖ, обороты убраны);
      общий пробег и моточасы (NVS + карта microSD: /krenometr/counters.txt, log.csv, trips.csv), /odo;
      ноль гироскопа подстраивается на стоянке (по скорости) и в движении (по повороту GPS) — курс не уплывает
+
+  v3.14 — на экране кренометра объёмная машина: вид сзади и сбоку поворачиваются сразу по крену и тангажу
 */
 
 #pragma GCC optimize("O2")
@@ -124,7 +126,7 @@ struct ClockData;
 #define ELM_HOST       "192.168.0.10"
 #define ELM_PORT       35000
 #define ELM_PROTO      "6"     // ATSP: 6 — CAN 11 бит 500 кбит/с
-#define FW_VERSION     "3.13"
+#define FW_VERSION     "3.14"
 #define APP_UDP_PORT   4210    // поток данных для Android-приложения
 #define APP_PERIOD_MS  40      // 25 пакетов в секунду
 #define APP_TIMEOUT_MS 3000    // приложение молчит дольше — перестаём слать
@@ -1707,6 +1709,175 @@ void carSide(float cx, float cy, float pitchDeg, float scale = 0.82f) {
   }
 }
 
+// ---- Объёмная машина (v3.14): та же модель, что в приложении (Car3D.kt) ----
+// Оси машины: X — вперёд, Y — влево, Z — вверх, дециметры. Грани с отсечением задних, сортировка по глубине.
+struct Face3 { uint16_t c; uint8_t n; float p[10][3]; float in[3]; };
+static Face3 *c3faces = nullptr;
+static int c3n = 0;
+
+static void c3add(uint16_t c, int n, float (*p)[3], const float in[3]) {
+  if (c3n >= 128) return;
+  Face3 &f = c3faces[c3n++];
+  f.c = c; f.n = n;
+  for (int i = 0; i < n; i++) for (int k = 0; k < 3; k++) f.p[i][k] = p[i][k];
+  for (int k = 0; k < 3; k++) f.in[k] = in[k];
+}
+// шестигранник: кольца r и f по 4 точки (низ-лево, низ-право, верх-право, верх-лево); cols — цвета граней или null
+static void c3hexa(uint16_t c, const float r[4][3], const float f[4][3], const uint16_t *cols = nullptr) {
+  float in[3] = {0, 0, 0};
+  for (int i = 0; i < 4; i++) for (int k = 0; k < 3; k++) in[k] += (r[i][k] + f[i][k]) / 8;
+  const float *q[6][4] = {
+    {r[0], r[1], r[2], r[3]}, {f[0], f[3], f[2], f[1]}, {r[0], r[3], f[3], f[0]},
+    {r[1], f[1], f[2], r[2]}, {r[3], r[2], f[2], f[3]}, {r[0], f[0], f[1], r[1]} };
+  for (int i = 0; i < 6; i++) {
+    float p[4][3];
+    for (int j = 0; j < 4; j++) for (int k = 0; k < 3; k++) p[j][k] = q[i][j][k];
+    c3add(cols ? cols[i] : c, 4, p, in);
+  }
+}
+#define V3(x, y, z) {x, y, z}
+static void c3quad(uint16_t c, const float in[3], float x0, float y0, float z0, float x1, float y1, float z1,
+                   float x2, float y2, float z2, float x3, float y3, float z3) {
+  float p[4][3] = {V3(x0, y0, z0), V3(x1, y1, z1), V3(x2, y2, z2), V3(x3, y3, z3)};
+  c3add(c, 4, p, in);
+}
+
+void car3dBuild() {
+  if (c3faces) return;
+  c3faces = (Face3 *)heap_caps_malloc(sizeof(Face3) * 128, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!c3faces) c3faces = (Face3 *)malloc(sizeof(Face3) * 128);
+  if (!c3faces) return;
+  const uint16_t body = CAR_BLUE, glass = CAR_GLASS, trim = CAR_TRIM;
+  { float r[4][3] = {V3(-23.5f, 8.2f, 4.6f), V3(-23.5f, -8.2f, 4.6f), V3(-23.5f, -8.2f, 10.5f), V3(-23.5f, 8.2f, 10.5f)};
+    float f[4][3] = {V3(10, 8.2f, 4.6f), V3(10, -8.2f, 4.6f), V3(10, -8.2f, 10.5f), V3(10, 8.2f, 10.5f)};
+    c3hexa(body, r, f);
+    float g[4][3] = {V3(23.5f, 7.9f, 4.6f), V3(23.5f, -7.9f, 4.6f), V3(23.5f, -7.9f, 8.8f), V3(23.5f, 7.9f, 8.8f)};
+    c3hexa(body, f, g); }
+  { float r[4][3] = {V3(-24.3f, 8, 3.6f), V3(-24.3f, -8, 3.6f), V3(-24.3f, -8, 5.8f), V3(-24.3f, 8, 5.8f)};
+    float f[4][3] = {V3(-22.8f, 8, 3.6f), V3(-22.8f, -8, 3.6f), V3(-22.8f, -8, 5.8f), V3(-22.8f, 8, 5.8f)};
+    c3hexa(trim, r, f); }
+  { float r[4][3] = {V3(22.8f, 8, 3.6f), V3(22.8f, -8, 3.6f), V3(22.8f, -8, 6.2f), V3(22.8f, 8, 6.2f)};
+    float f[4][3] = {V3(24.5f, 7.6f, 3.6f), V3(24.5f, -7.6f, 3.6f), V3(24.5f, -7.6f, 6.2f), V3(24.5f, 7.6f, 6.2f)};
+    c3hexa(trim, r, f); }
+  { float r[4][3] = {V3(-22.6f, 7.9f, 10.5f), V3(-22.6f, -7.9f, 10.5f), V3(-21.6f, -7.0f, 17.2f), V3(-21.6f, 7.0f, 17.2f)};
+    float f[4][3] = {V3(9.5f, 7.9f, 10.5f), V3(9.5f, -7.9f, 10.5f), V3(-1.0f, -7.0f, 17.2f), V3(-1.0f, 7.0f, 17.2f)};
+    const uint16_t cols[6] = {glass, glass, glass, glass, body, body};
+    c3hexa(glass, r, f, cols); }
+  const float cabIn[3] = {-8, 0, 14};
+  for (float s : {1.0f, -1.0f}) {
+    float yb = 7.9f * s + 0.08f * s, yt = 7.0f * s + 0.08f * s;
+    c3quad(body, cabIn, -6.6f, yb, 10.5f, -5.0f, yb, 10.5f, -5.3f, yt, 17.2f, -6.9f, yt, 17.2f);
+    c3quad(body, cabIn, -22.6f, yb, 10.5f, -19.8f, yb, 10.5f, -19.4f, yt, 17.2f, -21.6f, yt, 17.2f);
+  }
+  { float r[4][3] = {V3(-15, 5.6f, 17.6f), V3(-15, -5.6f, 17.6f), V3(-14.4f, -5.2f, 20.2f), V3(-14.4f, 5.2f, 20.2f)};
+    float f[4][3] = {V3(5.5f, 5.6f, 17.6f), V3(5.5f, -5.6f, 17.6f), V3(3.5f, -5.2f, 19.6f), V3(3.5f, 5.2f, 19.6f)};
+    c3hexa(CAR_BOX, r, f); }
+  for (float s : {1.0f, -1.0f}) {
+    float y0 = 7.9f * s, y1 = 9.6f * s;
+    float r[4][3] = {V3(7.6f, y1, 11.0f), V3(7.6f, y0, 11.0f), V3(7.6f, y0, 12.4f), V3(7.6f, y1, 12.4f)};
+    float f[4][3] = {V3(8.6f, y1, 11.0f), V3(8.6f, y0, 11.0f), V3(8.6f, y0, 12.4f), V3(8.6f, y1, 12.4f)};
+    c3hexa(body, r, f);
+  }
+  const float rearIn[3] = {-6, 0, 7.5f}, frontIn[3] = {16, 0, 6.5f};
+  const float xr = -23.58f, xf = 23.58f;
+  for (float s : {1.0f, -1.0f})
+    c3quad(CAR_TAIL, rearIn, xr, 8.1f * s, 7.4f, xr, 5.4f * s, 7.4f, xr, 5.4f * s, 10.3f, xr, 8.1f * s, 10.3f);
+  c3quad(rgb(222, 222, 228), rearIn, xr, 2.6f, 6.2f, xr, -2.6f, 6.2f, xr, -2.6f, 7.6f, xr, 2.6f, 7.6f);
+  for (float s : {1.0f, -1.0f})
+    c3quad(rgb(230, 236, 246), frontIn, xf, 7.6f * s, 7.2f, xf, 4.6f * s, 7.2f, xf, 4.6f * s, 8.6f, xf, 7.6f * s, 8.6f);
+  c3quad(trim, frontIn, xf, 4.3f, 6.3f, xf, -4.3f, 6.3f, xf, -4.3f, 8.6f, xf, 4.3f, 8.6f);
+  const int N = 10;
+  for (float wx : {-14.0f, 14.0f}) for (float s : {1.0f, -1.0f}) {
+    float yo = 9.0f * s, yi = 6.4f * s, r = 3.8f, zc = 3.8f;
+    float wIn[3] = {wx, 7.7f * s, zc};
+    float outer[10][3], inner[10][3], rim[10][3], hub[6][3];
+    for (int i = 0; i < N; i++) {
+      float a = 2 * PI * i / N;
+      outer[i][0] = inner[i][0] = wx + r * cosf(a);
+      outer[i][2] = inner[i][2] = zc + r * sinf(a);
+      outer[i][1] = yo; inner[i][1] = yi;
+      rim[i][0] = wx + 2.5f * cosf(a); rim[i][1] = yo + 0.06f * s; rim[i][2] = zc + 2.5f * sinf(a);
+    }
+    for (int i = 0; i < 6; i++) {
+      float a = 2 * PI * i / 6;
+      hub[i][0] = wx + 0.9f * cosf(a); hub[i][1] = yo + 0.1f * s; hub[i][2] = zc + 0.9f * sinf(a);
+    }
+    c3add(CAR_TIRE, N, outer, wIn);
+    for (int i = 0; i < N; i++) {
+      int j = (i + 1) % N;
+      float q[4][3];
+      for (int k = 0; k < 3; k++) { q[0][k] = outer[i][k]; q[1][k] = outer[j][k]; q[2][k] = inner[j][k]; q[3][k] = inner[i][k]; }
+      c3add(CAR_TIRE, 4, q, wIn);
+    }
+    c3add(CAR_RIM, N, rim, wIn);
+    c3add(CAR_RIM2, 6, hub, wIn);
+  }
+}
+
+static uint16_t c3shade(uint16_t c, float f) {
+  if (f > 1.3f) f = 1.3f;
+  if (f < 0) f = 0;
+  int r = (int)(((c >> 11) & 31) * 8 * f), g = (int)(((c >> 5) & 63) * 4 * f), b = (int)((c & 31) * 8 * f);
+  return rgb(std::min(255, r), std::min(255, g), std::min(255, b));
+}
+
+// view 0 — сзади, 1 — сбоку (мордой вправо). roll > 0 — правый борт ниже, pitch > 0 — нос вверх.
+void car3d(int view, float cx, float cy, float k, float rollDeg, float pitchDeg) {
+  car3dBuild();
+  if (!c3faces) return;
+  struct Dr { float depth; uint16_t c; uint8_t n; float x[10], y[10]; };
+  static Dr dr[128];
+  static int order[128];
+  float cr = cosf(rollDeg * DEG), sr = sinf(rollDeg * DEG), cp = cosf(pitchDeg * DEG), sp = sinf(pitchDeg * DEG);
+  float e = (view == 0 ? 13.0f : 9.0f) * DEG, ce = cosf(e), se = sinf(e);
+  float dist = view == 0 ? 260.0f : 320.0f;
+  const float zc = 10;
+  float lx = -0.35f, ly = 0.75f, lz = -0.55f, ln = sqrtf(lx * lx + ly * ly + lz * lz);
+  lx /= ln; ly /= ln; lz /= ln;
+  auto cam = [&](const float *p, float *o, bool vec) {
+    float x = p[0], y = p[1], z = vec ? p[2] : p[2] - zc;
+    float y1 = y * cr - z * sr, z1 = y * sr + z * cr;
+    float x2 = x * cp - z1 * sp, z2 = x * sp + z1 * cp;
+    if (view == 0) { o[0] = -y1; o[1] = z2 * ce + x2 * se; o[2] = x2 * ce - z2 * se; }
+    else           { o[0] = x2;  o[1] = z2 * ce + y1 * se; o[2] = y1 * ce - z2 * se; }
+  };
+  int m = 0;
+  for (int fi = 0; fi < c3n; fi++) {
+    const Face3 &f = c3faces[fi];
+    float u0 = f.p[1][0] - f.p[0][0], u1 = f.p[1][1] - f.p[0][1], u2 = f.p[1][2] - f.p[0][2];
+    float w0 = f.p[2][0] - f.p[0][0], w1 = f.p[2][1] - f.p[0][1], w2 = f.p[2][2] - f.p[0][2];
+    float n[3] = { u1 * w2 - u2 * w1, u2 * w0 - u0 * w2, u0 * w1 - u1 * w0 };
+    float g[3] = {0, 0, 0};
+    for (int i = 0; i < f.n; i++) for (int q = 0; q < 3; q++) g[q] += f.p[i][q] / f.n;
+    if (n[0] * (g[0] - f.in[0]) + n[1] * (g[1] - f.in[1]) + n[2] * (g[2] - f.in[2]) < 0) { n[0] = -n[0]; n[1] = -n[1]; n[2] = -n[2]; }
+    float a[3];
+    cam(n, a, true);
+    if (a[2] >= -1e-4f) continue;                     // грань смотрит от камеры
+    float l = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+    float lit = 0.55f + 0.6f * std::max(0.0f, (a[0] * lx + a[1] * ly + a[2] * lz) / l);
+    Dr &d = dr[m];
+    d.n = f.n; d.c = c3shade(f.c, lit); d.depth = 0;
+    for (int i = 0; i < f.n; i++) {
+      float b[3];
+      cam(f.p[i], b, false);
+      float pr = dist / (dist + b[2]);
+      d.x[i] = cx + k * b[0] * pr;
+      d.y[i] = cy - k * b[1] * pr;
+      d.depth += b[2];
+    }
+    d.depth /= f.n;
+    order[m] = m;
+    m++;
+  }
+  // дальние — первыми (вставками: граней немного)
+  for (int i = 1; i < m; i++) {
+    int t = order[i], j = i - 1;
+    while (j >= 0 && dr[order[j]].depth < dr[t].depth) { order[j + 1] = order[j]; j--; }
+    order[j + 1] = t;
+  }
+  for (int i = 0; i < m; i++) { const Dr &d = dr[order[i]]; polyAA(d.x, d.y, d.n, d.c); }
+}
+
 // Шкала-«кольцо активности» по дуге: от 0 до значения, ±SCALE_MAX на ±62°
 void tiltArc(float centerDeg, float dir, float value, float warn, float danger) {
   const float R = 101, W = 7, SPAN = 62;
@@ -1817,8 +1988,9 @@ void pageTilt(float roll, float pitch) {
   tiltPointer(1, pitch, pc == IOS_RED ? IOS_RED : TL_AMBER);
 
   // машины и значения
-  carRear(120, 72, roll, 0.68f);
-  carSide(120, 152, pitch, 0.66f);
+  // объёмная машина: обе проекции поворачиваются и по крену, и по тангажу (v3.14)
+  car3d(0, 120, 66, 2.0f, roll, pitch);
+  car3d(1, 120, 157, 1.28f, roll, pitch);
   char b[16];
   fmtNum(b, sizeof(b), lroundf(roll), 0);
   text(120, 110, b, F_VAL, rc == IOS_GREEN ? IOS_WHITE : rc);
