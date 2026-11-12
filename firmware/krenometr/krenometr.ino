@@ -48,6 +48,7 @@
      ноль гироскопа подстраивается на стоянке (по скорости) и в движении (по повороту GPS) — курс не уплывает
 
   v3.14 — на экране кренометра объёмная машина: вид сзади и сбоку поворачиваются сразу по крену и тангажу
+  v3.15 — исправлена перезагрузка по кругу при связи по USB: запрос трека (/trk) переполнял стек задачи связи
 */
 
 #pragma GCC optimize("O2")
@@ -126,7 +127,7 @@ struct ClockData;
 #define ELM_HOST       "192.168.0.10"
 #define ELM_PORT       35000
 #define ELM_PROTO      "6"     // ATSP: 6 — CAN 11 бит 500 кбит/с
-#define FW_VERSION     "3.14"
+#define FW_VERSION     "3.15"
 #define APP_UDP_PORT   4210    // поток данных для Android-приложения
 #define APP_PERIOD_MS  40      // 25 пакетов в секунду
 #define APP_TIMEOUT_MS 3000    // приложение молчит дольше — перестаём слать
@@ -3521,8 +3522,9 @@ void setup() {
 #else
   if (g_apAlways) wifiStart();
 #endif
-  xTaskCreatePinnedToCore(appUdpTask, "app", 4096, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(counterTask, "cnt", 6144, NULL, 1, NULL, 0);
+  // стеки с запасом: в задаче связи по USB формируются пакет, трек (/trk) и ответы терминала (v3.15)
+  xTaskCreatePinnedToCore(appUdpTask, "app", 16384, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(counterTask, "cnt", 10240, NULL, 1, NULL, 0);
 }
 
 // Состояние кадра: считается один раз, а рисуется по полосам
