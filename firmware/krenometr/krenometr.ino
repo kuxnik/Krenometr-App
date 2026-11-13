@@ -3332,13 +3332,10 @@ void counterTask(void *) {
       File f = SD.open(TRIP_FILE, rewrite ? FILE_WRITE : FILE_APPEND);
       if (!f) g_sdState = 2;
       else {
-        if (rewrite) { f.printf("trip %lu
-", (unsigned long)tid); sdOrg = false; }
-        if (orgNow && !sdOrg) { f.printf("o %.7f %.7f %.1f %.1f
-", (double)g_orgLat, (double)g_orgLon, (float)g_orgX, (float)g_orgY); sdOrg = true; }
+        if (rewrite) { f.printf("trip %lu\n", (unsigned long)tid); sdOrg = false; }
+        if (orgNow && !sdOrg) { f.printf("o %.7f %.7f %.1f %.1f\n", (double)g_orgLat, (double)g_orgLon, (float)g_orgX, (float)g_orgY); sdOrg = true; }
         char l[40];
-        for (int i = 0; i < n; i++) { int k = snprintf(l, sizeof(l), "%.1f %.1f
-", tripBufX[i], tripBufY[i]); f.write((const uint8_t *)l, k); }
+        for (int i = 0; i < n; i++) { int k = snprintf(l, sizeof(l), "%.1f %.1f\n", tripBufX[i], tripBufY[i]); f.write((const uint8_t *)l, k); }
         f.close();
         sdHeader = true;
         sdPts = from + n;
