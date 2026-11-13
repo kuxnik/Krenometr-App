@@ -49,6 +49,10 @@
 
   v3.14 — на экране кренометра объёмная машина: вид сзади и сбоку поворачиваются сразу по крену и тангажу
   v3.15 — исправлена перезагрузка по кругу при связи по USB: запрос трека (/trk) переполнял стек задачи связи
+  v3.16 — поездка переживает выключение: трек пишется на microSD (/krenometr/trip.txt), положение, километраж
+     и привязка к GPS — ещё и в NVS; при включении всё восстанавливается. Привязка к GPS (начало координат)
+     уходит в приложение в каждом пакете («olat», «olon», «ox», «oy»). Большое расхождение с GPS (>150 м) —
+     положение переносится сразу, а не тянется прямой линией.
 */
 
 #pragma GCC optimize("O2")
@@ -127,7 +131,7 @@ struct ClockData;
 #define ELM_HOST       "192.168.0.10"
 #define ELM_PORT       35000
 #define ELM_PROTO      "6"     // ATSP: 6 — CAN 11 бит 500 кбит/с
-#define FW_VERSION     "3.15"
+#define FW_VERSION     "3.16"
 #define APP_UDP_PORT   4210    // поток данных для Android-приложения
 #define APP_PERIOD_MS  40      // 25 пакетов в секунду
 #define APP_TIMEOUT_MS 3000    // приложение молчит дольше — перестаём слать
@@ -209,6 +213,14 @@ volatile bool  g_bnoFound = false;
 volatile float g_posX = 0, g_posY = 0, g_odometer = 0;
 volatile bool  g_tripReset = false;
 volatile uint32_t g_tripId = 0;        // растёт при каждой новой поездке (приложение перечитывает трек)
+// привязка счисления к GPS (v3.16): точка (g_orgX, g_orgY) метров = (g_orgLat, g_orgLon)
+volatile bool     g_orgHave = false;
+volatile double   g_orgLat = 0, g_orgLon = 0;
+volatile float    g_orgX = 0, g_orgY = 0;
+volatile uint32_t g_orgTrip = 0;
+// восстановление поездки после включения (заполняет задача счётчиков, применяет задача датчиков)
+volatile bool     g_restoreReq = false;
+volatile float    g_restX = 0, g_restY = 0, g_restOdo = 0;
 // счётчики (v3.13): общий пробег и моточасы — NVS «cnt» и карта microSD
 volatile double   g_totalM = 0;          // общий пробег, м
 volatile double   g_engineS = 0;         // моточасы, с
@@ -746,7 +758,12 @@ void sensorTask(void *) {
         trackResetLocked();
         xSemaphoreGive(trackLock);
         g_tripId = g_tripId + 1;
+        g_orgHave = false;                       // новая поездка — привязку к GPS найдём заново
         g_tripReset = false;
+      }
+      if (g_restoreReq) {                        // поездка до выключения (v3.16)
+        posX = g_restX; posY = g_restY; odo = g_restOdo; lastPtX = posX; lastPtY = posY;
+        g_restoreReq = false;
       }
       // поправка от GPS магнитолы
       {
@@ -2865,21 +2882,22 @@ void appGps(const char *line) {
   g_gpsAcc = acc; g_gpsSpeed = spd < 0 ? 0 : spd; g_gpsAt = millis();
   // курс годится, только когда едем (от ~11 км/ч) и фикс точный
   if (nf == 5 && brg >= 0 && brg < 360 && spd >= 3.0f && acc <= 25) { g_gpsBrg = brg; g_gpsBrgSeq = g_gpsBrgSeq + 1; }
-  static bool have = false;
-  static uint32_t trip = 0;
-  static double lat0 = 0, lon0 = 0;
-  static float offX = 0, offY = 0;
   float px, py;
   portENTER_CRITICAL(&mux); px = g_posX; py = g_posY; portEXIT_CRITICAL(&mux);
-  if (!have || trip != g_tripId || acc > 50) {
+  if (!g_orgHave || g_orgTrip != g_tripId) {
     if (acc > 50) return;                        // слишком грубо даже для начала координат
-    have = true; trip = g_tripId; lat0 = lat; lon0 = lon; offX = px; offY = py;
+    g_orgLat = lat; g_orgLon = lon; g_orgX = px; g_orgY = py; g_orgTrip = g_tripId;
+    g_orgHave = true;
     return;
   }
-  float gx = offX + (float)((lon - lon0) * cos(lat0 * PI / 180.0) * 111320.0);
-  float gy = offY + (float)((lat - lat0) * 110540.0);
+  double lat0 = g_orgLat, lon0 = g_orgLon;
+  float gx = g_orgX + (float)((lon - lon0) * cos(lat0 * PI / 180.0) * 111320.0);
+  float gy = g_orgY + (float)((lat - lat0) * 110540.0);
   float k = acc <= 10 ? 0.25f : acc <= 25 ? 0.10f : 0.0f;
   if (k <= 0) return;
+  // далеко ушли от GPS (не было скорости, плата стояла без связи) — переносим сразу, без «прямой линии»
+  float ex = gx - px, ey = gy - py;
+  if (acc <= 25 && ex * ex + ey * ey > 150.0f * 150.0f) k = 1.0f;
   portENTER_CRITICAL(&mux);
   g_gpsCorrX += k * (gx - px); g_gpsCorrY += k * (gy - py);
   portEXIT_CRITICAL(&mux);
@@ -2896,6 +2914,9 @@ int appPacket(char *pkt, size_t sz) {
   px = g_posX; py = g_posY; odo = g_odometer;
   totKm = g_totalM / 1000.0; engH = g_engineS / 3600.0;
   portEXIT_CRITICAL(&mux);
+  bool oh = g_orgHave && g_orgTrip == g_tripId;
+  double olat = g_orgLat, olon = g_orgLon;
+  float ox = g_orgX, oy = g_orgY;
   uint32_t now = millis();
   auto fr = [now](uint32_t at, uint32_t ms) { return at != 0 && now - at < ms; };
   bool spdOk = USE_CAN && g_canOk && fr(g_speedAt, 1500);
@@ -2911,7 +2932,8 @@ int appPacket(char *pkt, size_t sz) {
     "\"cl\":%d,\"ia\":%d,\"u\":%.1f,\"f\":%d,"
     "\"w\":[%d,%d,%d,%d],\"wa\":%ld,"
     "\"scr\":%d,\"ap\":%d,\"zd\":%lu,\"tm\":%d,\"ga\":%.0f,"
-    "\"tot\":%.2f,\"mh\":%.3f,\"sd\":%d}",
+    "\"tot\":%.2f,\"mh\":%.3f,\"sd\":%d,"
+    "\"oh\":%d,\"olat\":%.7f,\"olon\":%.7f,\"ox\":%.1f,\"oy\":%.1f}",
     (unsigned long)appSeq++, g_calibrating ? 1 : 0, g_imuOk ? 1 : 0,
     roll, pitch, lon, lat,
     hdg, hs, (int)g_magAccuracy, !USE_BNO085 ? -1 : !g_bnoFound ? 0 : hs == 2 ? 2 : 1, (int)g_tiltSrc,
@@ -2928,7 +2950,8 @@ int appPacket(char *pkt, size_t sz) {
     g_screenOn ? 1 : 0, g_apAlways ? 1 : 0, (unsigned long)g_zeroDoneAt,
     (elmTermLastAt && now - elmTermLastAt < 60000) ? 1 : 0,
     fr(g_gpsAt, 3000) ? (float)g_gpsAcc : -1.0f,
-    totKm, engH, (int)g_sdState);
+    totKm, engH, (int)g_sdState,
+    oh ? 1 : 0, olat, olon, ox, oy);
 }
 
 void appHello(const char *in) {
@@ -3046,7 +3069,7 @@ void appUdpTask(void *) {
   bool bound = false;
   IPAddress cliIp; uint16_t cliPort = 0;
   uint32_t udpSeenAt = 0, usbSeenAt = 0;
-  char pkt[700];
+  char pkt[900];
   char ln[200]; int lnLen = 0;
   TickType_t wake = xTaskGetTickCount();
   for (;;) {
@@ -3161,6 +3184,64 @@ static bool sdAppend(const char *path, const char *header, const char *line) {
   return true;
 }
 
+// ---- Поездка между включениями (v3.16) ----
+// NVS «cnt»: tid, tx, ty, to (положение и путь поездки), oh/olat/olon/ox/oy (привязка к GPS) — раз в 10 с.
+// microSD /krenometr/trip.txt: «trip N», «o широта долгота x y», дальше точки трека «x y» — дописываются раз в 5 с.
+#define TRIP_FILE "/krenometr/trip.txt"
+static float *tripBufX = nullptr, *tripBufY = nullptr;   // PSRAM: чтение файла и выгрузка новых точек
+
+static void tripRestore(bool sdOk) {
+  uint32_t tid = prefsCnt.getUInt("tid", 0);
+  float tx = prefsCnt.getFloat("tx", 0), ty = prefsCnt.getFloat("ty", 0), to = prefsCnt.getFloat("to", 0);
+  bool oh = prefsCnt.getBool("oh", false);
+  double olat = prefsCnt.getDouble("olat", 0), olon = prefsCnt.getDouble("olon", 0);
+  float ox = prefsCnt.getFloat("ox", 0), oy = prefsCnt.getFloat("oy", 0);
+  bool haveNvs = prefsCnt.isKey("tid");
+  int n = 0;
+  if (sdOk && SD.exists(TRIP_FILE)) {
+    File f = SD.open(TRIP_FILE, FILE_READ);
+    if (f) {
+      uint32_t ftid = 0; bool fo = false; double flat = 0, flon = 0; float fx = 0, fy = 0;
+      char l[96];
+      while (f.available()) {
+        int k = f.readBytesUntil('\n', l, sizeof(l) - 1);
+        l[k] = 0;
+        if (k <= 0) continue;
+        if (strncmp(l, "trip ", 5) == 0) { ftid = strtoul(l + 5, nullptr, 10); n = 0; continue; }
+        if (l[0] == 'o' && l[1] == ' ') { if (sscanf(l + 2, "%lf %lf %f %f", &flat, &flon, &fx, &fy) == 4) fo = true; continue; }
+        float x, y;
+        if (sscanf(l, "%f %f", &x, &y) == 2) {
+          if (n >= TRACK_MAX * 4) {                // очень длинная поездка — прореживаем вдвое
+            int m = 0;
+            for (int i = 0; i < n; i += 2) { tripBufX[m] = tripBufX[i]; tripBufY[m] = tripBufY[i]; m++; }
+            n = m;
+          }
+          tripBufX[n] = x; tripBufY[n] = y; n++;
+        }
+      }
+      f.close();
+      if (!haveNvs || ftid == tid) {             // файл и NVS про одну и ту же поездку
+        tid = ftid;
+        if (fo) { oh = true; olat = flat; olon = flon; ox = fx; oy = fy; }
+        if (!haveNvs && n > 0) { tx = tripBufX[n - 1]; ty = tripBufY[n - 1]; }
+      } else n = 0;
+    }
+  }
+  if (!haveNvs && n == 0) return;                // первое включение — восстанавливать нечего
+  // трек — в рабочий массив (прорежённый до TRACK_MAX)
+  xSemaphoreTake(trackLock, portMAX_DELAY);
+  int step = n > TRACK_MAX ? (n + TRACK_MAX - 1) / TRACK_MAX : 1, m = 0;
+  for (int i = 0; i < n && m < TRACK_MAX; i += step) { trackX[m] = tripBufX[i]; trackY[m] = tripBufY[i]; m++; }
+  if (m == 0) { trackX[0] = 0; trackY[0] = 0; m = 1; }
+  trackN = m;
+  xSemaphoreGive(trackLock);
+  g_tripId = tid;
+  if (oh) { g_orgLat = olat; g_orgLon = olon; g_orgX = ox; g_orgY = oy; g_orgTrip = tid; g_orgHave = true; }
+  g_restX = tx; g_restY = ty; g_restOdo = to;
+  g_restoreReq = true;
+  Serial.printf("Поездка %lu восстановлена: %d точек, %.1f км\n", (unsigned long)tid, n, to / 1000.0f);
+}
+
 void counterTask(void *) {
   prefsCnt.begin("cnt", false);
   double km = prefsCnt.getDouble("km", 0), eh = prefsCnt.getDouble("eh", 0);
@@ -3176,11 +3257,24 @@ void counterTask(void *) {
   g_engineS = g_engineS + eh * 3600.0;
   portEXIT_CRITICAL(&mux);
   Serial.printf("Счётчики: %.1f км, %.2f моточаса, SD %s\n", km, eh, sdOk ? "есть" : "нет");
+  tripBufX = (float *)heap_caps_malloc(sizeof(float) * TRACK_MAX * 4, MALLOC_CAP_SPIRAM);
+  tripBufY = (float *)heap_caps_malloc(sizeof(float) * TRACK_MAX * 4, MALLOC_CAP_SPIRAM);
+  if (tripBufX && tripBufY) tripRestore(sdOk);
+  int sdPts = 0;                                 // сколько точек трека уже на карте
+  bool sdHeader = false, sdOrg = false;          // файл начат для текущей поездки, привязка записана
+  if (sdOk && SD.exists(TRIP_FILE)) {            // восстановили — дописываем в тот же файл
+    xSemaphoreTake(trackLock, portMAX_DELAY); sdPts = trackN; xSemaphoreGive(trackLock);
+    sdHeader = true; sdOrg = g_orgHave;
+  }
+  uint32_t lastTripSave = 0, lastSdTrack = 0;
+  float savedTx = 1e9f, savedTy = 1e9f;
+  bool savedOrg = g_orgHave;
 
   uint32_t lastTick = millis(), lastSave = millis(), lastSdTry = millis();
   double savedKm = km, savedEh = eh;
   uint32_t lastTrip = g_tripId;
   float lastOdo = 0;
+  vTaskDelay(pdMS_TO_TICKS(300));                // задача датчиков успевает применить восстановление
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000));
     uint32_t now = millis();
@@ -3204,6 +3298,52 @@ void counterTask(void *) {
       lastTrip = tid;
     }
     lastOdo = odo;
+
+    // ---- поездка в NVS (раз в 10 с, если сдвинулись) ----
+    float px, py;
+    portENTER_CRITICAL(&mux); px = g_posX; py = g_posY; portEXIT_CRITICAL(&mux);
+    if (now - lastTripSave > 10000 && (fabsf(px - savedTx) > 1 || fabsf(py - savedTy) > 1)) {
+      lastTripSave = now; savedTx = px; savedTy = py;
+      prefsCnt.putUInt("tid", tid);
+      prefsCnt.putFloat("tx", px); prefsCnt.putFloat("ty", py); prefsCnt.putFloat("to", odo);
+    }
+    bool orgNow = g_orgHave && g_orgTrip == tid;
+    if (orgNow != savedOrg) {
+      savedOrg = orgNow;
+      prefsCnt.putBool("oh", orgNow);
+      if (orgNow) {
+        prefsCnt.putDouble("olat", g_orgLat); prefsCnt.putDouble("olon", g_orgLon);
+        prefsCnt.putFloat("ox", g_orgX); prefsCnt.putFloat("oy", g_orgY);
+      }
+    }
+
+    // ---- трек на microSD (раз в 5 с) ----
+    if (g_sdState == 1 && tripBufX && now - lastSdTrack > 5000) {
+      lastSdTrack = now;
+      static uint32_t fileTrip = 0xFFFFFFFF;
+      int n = 0, from = 0; bool rewrite = false;
+      xSemaphoreTake(trackLock, portMAX_DELAY);
+      int tn = trackN;
+      if (!sdHeader || (fileTrip != tid && fileTrip != 0xFFFFFFFF) || tn < sdPts) rewrite = true;   // новая поездка или прореживание
+      from = rewrite ? 0 : sdPts;
+      for (int i = from; i < tn && n < TRACK_MAX * 4; i++, n++) { tripBufX[n] = trackX[i]; tripBufY[n] = trackY[i]; }
+      xSemaphoreGive(trackLock);
+      fileTrip = tid;
+      File f = SD.open(TRIP_FILE, rewrite ? FILE_WRITE : FILE_APPEND);
+      if (!f) g_sdState = 2;
+      else {
+        if (rewrite) { f.printf("trip %lu
+", (unsigned long)tid); sdOrg = false; }
+        if (orgNow && !sdOrg) { f.printf("o %.7f %.7f %.1f %.1f
+", (double)g_orgLat, (double)g_orgLon, (float)g_orgX, (float)g_orgY); sdOrg = true; }
+        char l[40];
+        for (int i = 0; i < n; i++) { int k = snprintf(l, sizeof(l), "%.1f %.1f
+", tripBufX[i], tripBufY[i]); f.write((const uint8_t *)l, k); }
+        f.close();
+        sdHeader = true;
+        sdPts = from + n;
+      }
+    }
 
     // карту вставили позже или она отвалилась — пробуем раз в 30 с
     if (g_sdState != 1 && now - lastSdTry > 30000) {
