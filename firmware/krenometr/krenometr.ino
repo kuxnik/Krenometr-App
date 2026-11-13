@@ -55,6 +55,8 @@
      положение переносится сразу, а не тянется прямой линией.
   v3.17 — экран колёс больше не отключает наддув, ATF и бортсеть: ABS опрашивается через раз,
      а между ними — обычный круг (скорость, наддув, обороты, ОЖ, впуск, напряжение, ATF)
+  v3.18 — системный журнал ESP-IDF выключен: его строки (ошибки I2C сенсора) врезались в пакеты по USB;
+     сенсор, который не отвечает (спит), опрашивается реже
 */
 
 #pragma GCC optimize("O2")
@@ -69,6 +71,7 @@
 #include <SD.h>
 #include "driver/twai.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "driver/spi_master.h"
 #include <Arduino_GFX_Library.h>
 #include <math.h>
@@ -133,7 +136,7 @@ struct ClockData;
 #define ELM_HOST       "192.168.0.10"
 #define ELM_PORT       35000
 #define ELM_PROTO      "6"     // ATSP: 6 — CAN 11 бит 500 кбит/с
-#define FW_VERSION     "3.17"
+#define FW_VERSION     "3.18"
 #define APP_UDP_PORT   4210    // поток данных для Android-приложения
 #define APP_PERIOD_MS  40      // 25 пакетов в секунду
 #define APP_TIMEOUT_MS 3000    // приложение молчит дольше — перестаём слать
@@ -365,7 +368,16 @@ void touchInit() {}
 
 bool touchPressed() {
   uint8_t b[5];
-  if (!i2cRead(TOUCH_ADDR, 0x02, b, 5)) return false;
+  // сенсор FT3168 в простое засыпает и не отвечает — тогда спрашиваем реже (каждые ~200 мс), не забивая шину
+  static uint16_t fails = 0;
+  static uint32_t skipUntil = 0;
+  if (fails > 10 && millis() < skipUntil) return false;
+  if (!i2cRead(TOUCH_ADDR, 0x02, b, 5)) {
+    if (fails < 1000) fails++;
+    skipUntil = millis() + 200;
+    return false;
+  }
+  fails = 0;
   if ((b[0] & 0x0F) == 0) return false;
   // координаты экрана 466x466 -> логические 240x240
   int16_t tx = (int16_t)(((((b[1] & 0x0F) << 8) | b[2])) * 240 / PW);
@@ -3607,6 +3619,7 @@ void setup() {
   Serial.setTxTimeoutMs(20);             // магнитола не читает — не тормозить
 #endif
   Serial.begin(115200);
+  esp_log_level_set("*", ESP_LOG_NONE);          // журнал ESP-IDF идёт в USB мимо Serial и рвёт пакеты (v3.18)
   uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 3000) delay(10);   // ждём, пока компьютер откроет порт USB
   Serial.println();
