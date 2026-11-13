@@ -57,6 +57,8 @@
      а между ними — обычный круг (скорость, наддув, обороты, ОЖ, впуск, напряжение, ATF)
   v3.18 — системный журнал ESP-IDF выключен: его строки (ошибки I2C сенсора) врезались в пакеты по USB;
      сенсор, который не отвечает (спит), опрашивается реже
+  v3.19 — трек без прямых: точка ставится при любом смещении на 5 м (и от счисления, и от поправки GPS);
+     при точном GPS (±10 м) положение подтягивается к нему на половину расхождения за фикс
 */
 
 #pragma GCC optimize("O2")
@@ -136,7 +138,7 @@ struct ClockData;
 #define ELM_HOST       "192.168.0.10"
 #define ELM_PORT       35000
 #define ELM_PROTO      "6"     // ATSP: 6 — CAN 11 бит 500 кбит/с
-#define FW_VERSION     "3.18"
+#define FW_VERSION     "3.19"
 #define APP_UDP_PORT   4210    // поток данных для Android-приложения
 #define APP_PERIOD_MS  40      // 25 пакетов в секунду
 #define APP_TIMEOUT_MS 3000    // приложение молчит дольше — перестаём слать
@@ -797,6 +799,9 @@ void sensorTask(void *) {
         posX += ds * sinf(hdg * DEG);
         posY += ds * cosf(hdg * DEG);
         odo += ds;
+      }
+      // точка трека — при любом смещении: по счислению или по поправке GPS (без скорости машину двигает GPS)
+      {
         float ex = posX - lastPtX, ey = posY - lastPtY;
         if (ex * ex + ey * ey > TRACK_STEP_M * TRACK_STEP_M) {
           trackAppend(posX, posY);
@@ -2905,7 +2910,7 @@ void appGps(const char *line) {
   double lat0 = g_orgLat, lon0 = g_orgLon;
   float gx = g_orgX + (float)((lon - lon0) * cos(lat0 * PI / 180.0) * 111320.0);
   float gy = g_orgY + (float)((lat - lat0) * 110540.0);
-  float k = acc <= 10 ? 0.25f : acc <= 25 ? 0.10f : 0.0f;
+  float k = acc <= 10 ? 0.5f : acc <= 25 ? 0.25f : 0.0f;   // v3.19: точный GPS — главный, счисление между фиксами
   if (k <= 0) return;
   // далеко ушли от GPS (не было скорости, плата стояла без связи) — переносим сразу, без «прямой линии»
   float ex = gx - px, ey = gy - py;
