@@ -53,6 +53,8 @@
      и привязка к GPS — ещё и в NVS; при включении всё восстанавливается. Привязка к GPS (начало координат)
      уходит в приложение в каждом пакете («olat», «olon», «ox», «oy»). Большое расхождение с GPS (>150 м) —
      положение переносится сразу, а не тянется прямой линией.
+  v3.17 — экран колёс больше не отключает наддув, ATF и бортсеть: ABS опрашивается через раз,
+     а между ними — обычный круг (скорость, наддув, обороты, ОЖ, впуск, напряжение, ATF)
 */
 
 #pragma GCC optimize("O2")
@@ -131,7 +133,7 @@ struct ClockData;
 #define ELM_HOST       "192.168.0.10"
 #define ELM_PORT       35000
 #define ELM_PROTO      "6"     // ATSP: 6 — CAN 11 бит 500 кбит/с
-#define FW_VERSION     "3.16"
+#define FW_VERSION     "3.17"
 #define APP_UDP_PORT   4210    // поток данных для Android-приложения
 #define APP_PERIOD_MS  40      // 25 пакетов в секунду
 #define APP_TIMEOUT_MS 3000    // приложение молчит дольше — перестаём слать
@@ -1179,10 +1181,8 @@ void elmTask(void *) {
     if (g_wantWheels && (wheelTurn = !wheelTurn)) {
       elmWheels();                               // экран колёс: колёса и скорость по очереди
     } else {
-      static uint8_t wcnt = 0;
-      ++wcnt;
-      pid = g_wantWheels ? (wcnt % 10 == 0 ? PID_COOLANT : wcnt % 10 == 5 ? PID_RPM : PID_SPEED) : seq[idx];
-      if (!g_wantWheels) idx = (idx + 1) % 8;
+      pid = seq[idx];                            // обычный круг — и при экране колёс тоже (v3.17)
+      idx = (idx + 1) % 8;
       if (pid) ok = elmPid(pid);
       else {
         // ОЖ — через раз среди медленных, остальное по очереди
